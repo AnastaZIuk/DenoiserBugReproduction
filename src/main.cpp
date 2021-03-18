@@ -61,12 +61,12 @@ int main()
 
 	constexpr std::array<std::string_view, 3> hardcodedInputs =
 	{
-		"spp_benchmark_4k_512_reference_optix_input_albedo.dds",
 		"spp_benchmark_4k_512_reference_optix_input_color.dds",
+		"spp_benchmark_4k_512_reference_optix_input_albedo.dds",
 		"spp_benchmark_4k_512_reference_optix_input_normal.dds"
 	};
 
-	uint32_t maxResolution[2] = { 0,0 };
+	uint32_t resolution[2] = { 0,0 };
 	std::array<gli::texture, hardcodedInputs.size()> inputKindTextures;
 	gli::texture outputTexture;
 	{
@@ -81,8 +81,13 @@ int main()
 
 			auto extent = inputKindTextures[offset].extent(0);
 
-			maxResolution[0] = std::max<uint32_t>(extent.x, maxResolution[0]);
-			maxResolution[1] = std::max<uint32_t>(extent.y, maxResolution[1]);
+			for (auto i=0; i<2; i++)
+			if (resolution[i])
+			{
+				assert(resolution[i]==extent[i]);
+			}
+			else
+				resolution[i] = extent[i];
 
 			if (offset == 0u)
 				outputTexture = inputKindTextures[offset]; // For copying header data
@@ -92,7 +97,7 @@ int main()
 	}
 
 	CUdevice device;
-	CU_CHECK(cuDeviceGet(&device,0u)); // it won't work
+	CU_CHECK(cuDeviceGet(&device,0u));
 
 	// create context
 	CUcontext context;
@@ -169,7 +174,7 @@ int main()
 
 		denoiserStateBufferSize = denoiserMemReqs.stateSizeInBytes;
 		scratchBufferSize = denoiserMemReqs.withOverlapScratchSizeInBytes;
-		singleInputBufferSize = forcedOptiXFormatPixelStride * maxResolution[0] * maxResolution[1];
+		singleInputBufferSize = forcedOptiXFormatPixelStride * resolution[0] * resolution[1];
 	}
 	const size_t pixelBufferSize = singleInputBufferSize*kInputBufferCount;
 
@@ -182,8 +187,10 @@ int main()
 	assert(status); // No input files at all!
 
 	CUdeviceptr denoiserState;
-
 	CU_CHECK(cuMemAlloc(&denoiserState, denoiserStateBufferSize));
+
+	CUdeviceptr scratch;
+	CU_CHECK(cuMemAlloc(&scratch, scratchBufferSize));
 
 	CUdeviceptr	imageIntensity;
 	CU_CHECK(cuMemAlloc(&imageIntensity, sizeof(float)));
@@ -214,7 +221,7 @@ int main()
 		}
 	}
 
-	OPTIX_CHECK(optixDenoiserSetup(denoiser, stream, maxResolution[0], maxResolution[1], denoiserState, denoiserStateBufferSize, outputPixelBuffer, singleInputBufferSize));
+	OPTIX_CHECK(optixDenoiserSetup(denoiser, stream, outputDimensions[0], outputDimensions[1], denoiserState, denoiserStateBufferSize, scratch, scratchBufferSize));
 
 	OptixImage2D denoiserInputs[3];
 	OptixImage2D denoiserOutput;
@@ -222,28 +229,31 @@ int main()
 	for (size_t k = 0; k < hardcodedInputs.size(); k++)
 	{
 		denoiserInputs[k].data = inputPixelBuffers[k];
-		denoiserInputs[k].width = maxResolution[0];
-		denoiserInputs[k].height = maxResolution[1];
-		denoiserInputs[k].rowStrideInBytes = maxResolution[0] * forcedOptiXFormatPixelStride;
+		denoiserInputs[k].width = resolution[0];
+		denoiserInputs[k].height = resolution[1];
+		denoiserInputs[k].rowStrideInBytes = resolution[0] * forcedOptiXFormatPixelStride;
 		denoiserInputs[k].format = forcedOptiXFormat;
 		denoiserInputs[k].pixelStrideInBytes = forcedOptiXFormatPixelStride;
 	}
 
 	denoiserOutput.data = outputPixelBuffer;
-	denoiserOutput.width = maxResolution[0];
-	denoiserOutput.height = maxResolution[1];
-	denoiserOutput.rowStrideInBytes = maxResolution[0] * forcedOptiXFormatPixelStride;
+	denoiserOutput.width = resolution[0];
+	denoiserOutput.height = resolution[1];
+	denoiserOutput.rowStrideInBytes = resolution[0] * forcedOptiXFormatPixelStride;
 	denoiserOutput.format = forcedOptiXFormat;
 	denoiserOutput.pixelStrideInBytes = forcedOptiXFormatPixelStride;
 
-	OPTIX_CHECK(optixDenoiserComputeIntensity(denoiser, stream, denoiserInputs, imageIntensity, outputPixelBuffer, singleInputBufferSize));
+	// This function needs scratch memory with a size of at least sizeof(int)*(2+inputImage::width*inputImage::height)
+	assert(singleInputBufferSize>=sizeof(int)*(2u+resolution[0]*resolution[1]));
+	OPTIX_CHECK(optixDenoiserComputeIntensity(denoiser, stream, denoiserInputs+0u, imageIntensity, outputPixelBuffer, singleInputBufferSize));
 
 	OptixDenoiserParams optixDenoiserParams;
-	optixDenoiserParams.blendFactor = 0;
 	optixDenoiserParams.denoiseAlpha = 0;
+	optixDenoiserParams.blendFactor = 0;
 	optixDenoiserParams.hdrIntensity = imageIntensity;
+	optixDenoiserParams.hdrAverageColor = 0u;
 
-	OPTIX_CHECK(optixUtilDenoiserInvokeTiled( // OPTIX_ERROR_INVALID_VALUE
+	OPTIX_CHECK(optixUtilDenoiserInvokeTiled(
 		denoiser,
 		stream,
 		&optixDenoiserParams,
@@ -252,14 +262,15 @@ int main()
 		denoiserInputs,
 		hardcodedInputs.size(),
 		&denoiserOutput,
-		outputPixelBuffer,
+		scratch,
 		scratchBufferSize,
 		overlap,
 		tileWidth,
 		tileHeight));
+	CU_CHECK(cuStreamSynchronize(stream));
 
 	CU_CHECK(cuMemcpyDtoH_v2(outputTexture.data(0, 0, 0), outputPixelBuffer, singleInputBufferSize));
 
-	status = gli::save_dds(outputTexture, "outputResult.dds");
+	status = gli::save_dds(outputTexture, std::string(DBR_ROOT) + "/outputResult.dds");
 	assert(status); // Could not save output texture!
 }
